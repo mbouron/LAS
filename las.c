@@ -23,6 +23,7 @@
 #include <err.h>
 #include <libavcodec/avfft.h>
 #include <libavformat/avformat.h>
+#include <libavutil/intreadwrite.h>
 
 #define FFT_NBITS   9
 #define FFT_WINSIZE (1<<FFT_NBITS)
@@ -30,9 +31,10 @@
 struct las {
     AVCodecContext *codec;
     uint8_t *audio_buf;
-    int16_t *samples;
+    uint8_t *samples;
     int samples_bsize;
     int filled;
+    int bytes_per_sample;
     RDFTContext *rdft;
     FFTSample *rdft_data;
     int win_count;
@@ -47,13 +49,10 @@ static void precalc_hann(void)
         hann[i] = .5f * (1 - cos(2*M_PI*i / (FFT_WINSIZE-1)));
 }
 
-static void process_samples(struct las *c)
+static void feed_fft_data_16(struct las *c)
 {
-    c->win_count++;
-    c->filled = 0;
+    int16_t *s16 = (int16_t*)c->samples;
 
-    // Resample (int16_t to float), downmix if necessary and apply Hann window
-    int16_t *s16 = c->samples;
     switch (c->codec->channels) {
     case 2:
         for (int i = 0; i < FFT_WINSIZE; i++)
@@ -64,6 +63,34 @@ static void process_samples(struct las *c)
             c->rdft_data[i] = s16[i] / 32768.f * hann[i];
         break;
     }
+}
+
+static void feed_fft_data_24(struct las *c)
+{
+    switch (c->codec->channels) {
+    case 2:
+        for (int i = 0; i < FFT_WINSIZE; i++)
+            c->rdft_data[i] = (AV_RB24(c->samples + i * 2 * 3) + AV_RB24(c->samples + i * 2 * 3 + 1)) / (2 * 8388608.f) * hann[i];
+        break;
+    case 1:
+        for (int i = 0; i < FFT_WINSIZE; i++)
+            c->rdft_data[i] = AV_RB24(c->samples + (i * 3 ))  / 8388608.f * hann[i];
+        break;
+    }
+}
+
+static int process_samples(struct las *c)
+{
+    c->win_count++;
+    c->filled = 0;
+
+    if (c->bytes_per_sample == 2) {
+        feed_fft_data_16(c);
+    } else if (c->bytes_per_sample == 3) {
+        feed_fft_data_24(c);
+    } else {
+        return -1;
+    }
 
     // FFT
 #define FFT_ASSIGN_VALUES(i, re, im) c->fft[i] += re*re + im*im
@@ -73,6 +100,7 @@ static void process_samples(struct las *c)
         FFT_ASSIGN_VALUES(i, bin[i*2], bin[i*2+1]);
     FFT_ASSIGN_VALUES(0,             bin[0], 0);
     FFT_ASSIGN_VALUES(FFT_WINSIZE/2, bin[1], 0);
+    return 0;
 }
 
 static int process_audio_pkt(struct las *c, AVPacket *pkt)
@@ -135,9 +163,13 @@ int main(int ac, char **av)
     if (ctx.codec->channels != 1 && ctx.codec->channels != 2)
         errx(1, "unsupported number of channels (%d)", ctx.codec->channels);
 
+    ctx.bytes_per_sample = ctx.codec->bits_per_coded_sample / 8;
+    if (ctx.bytes_per_sample != 2 && ctx.bytes_per_sample != 3) {
+        errx(1, "unsupported audio sample depth (%d)", ctx.codec->bits_per_coded_sample);
+    }
     /* LAS init */
     precalc_hann();
-    ctx.samples_bsize = FFT_WINSIZE * ctx.codec->channels * sizeof(*ctx.samples);
+    ctx.samples_bsize = FFT_WINSIZE * ctx.codec->channels * sizeof(*ctx.samples) * ctx.bytes_per_sample;
     ctx.samples       = av_malloc(ctx.samples_bsize);
     ctx.rdft          = av_rdft_init(FFT_NBITS, DFT_R2C);
     ctx.rdft_data     = av_malloc(FFT_WINSIZE * sizeof(*ctx.rdft_data));
