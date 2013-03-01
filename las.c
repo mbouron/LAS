@@ -29,7 +29,7 @@
 
 struct las {
     AVCodecContext *codec;
-    uint8_t *audio_buf;
+    AVFrame *frame;
     int16_t *samples;
     int samples_bsize;
     int filled;
@@ -78,25 +78,26 @@ static void process_samples(struct las *c)
 static int process_audio_pkt(struct las *c, AVPacket *pkt)
 {
     while (pkt->size > 0) {
-        uint8_t *data = c->audio_buf;
-        int data_size = AVCODEC_MAX_AUDIO_FRAME_SIZE;
-        int len       = avcodec_decode_audio3(c->codec, (int16_t*)data, &data_size, pkt);
-        if (len < 0) {
+        AVFrame *decoded_frame = c->frame;
+        int got_frame = 0;
+        int len = avcodec_decode_audio4(c->codec, decoded_frame, &got_frame, pkt);
+
+        if (!got_frame || len < 0) {
             pkt->size = 0;
             return -1;
         }
         pkt->data += len;
         pkt->size -= len;
-        while (data_size > 0) {
+        while (len > 0) {
             int needed = c->samples_bsize - c->filled; // in bytes
-            int ncpy   = data_size >= needed ? needed : data_size;
-            memcpy((uint8_t*)c->samples + c->filled, data, ncpy);
+            int ncpy   = len >= needed ? needed : len;
+            memcpy((uint8_t*)c->samples + c->filled, decoded_frame->data, ncpy);
             c->filled += ncpy;
             if (c->filled != c->samples_bsize)
                 break;
             process_samples(c);
-            data      += ncpy;
-            data_size -= ncpy;
+            pkt->data += ncpy;
+            len       -= ncpy;
         }
     }
     return 0;
@@ -116,7 +117,7 @@ int main(int ac, char **av)
     av_register_all();
     AVFormatContext *fmt_ctx = NULL;
     if (avformat_open_input(&fmt_ctx, av[1], NULL, NULL) ||
-        av_find_stream_info(fmt_ctx) < 0)
+        avformat_find_stream_info(fmt_ctx, NULL) < 0)
         errx(1, "unable to load %s", av[1]);
     int stream_id = -1;
     for (i = 0; i < fmt_ctx->nb_streams; i++) {
@@ -131,7 +132,7 @@ int main(int ac, char **av)
     AVCodec *adec = avcodec_find_decoder(ctx.codec->codec_id);
     if (!adec)
         errx(1, "unsupported codec");
-    avcodec_open(ctx.codec, adec);
+    avcodec_open2(ctx.codec, adec, NULL);
     if (ctx.codec->channels != 1 && ctx.codec->channels != 2)
         errx(1, "unsupported number of channels (%d)", ctx.codec->channels);
 
@@ -141,7 +142,7 @@ int main(int ac, char **av)
     ctx.samples       = av_malloc(ctx.samples_bsize);
     ctx.rdft          = av_rdft_init(FFT_NBITS, DFT_R2C);
     ctx.rdft_data     = av_malloc(FFT_WINSIZE * sizeof(*ctx.rdft_data));
-    ctx.audio_buf     = av_malloc(AVCODEC_MAX_AUDIO_FRAME_SIZE);
+    ctx.frame         = avcodec_alloc_frame();
 
     /* Process packets */
     AVPacket pkt;
@@ -190,11 +191,11 @@ int main(int ac, char **av)
     printf("# higher freq=%dHz → %s\n", hfreq, hfreq < 21000 ? "lossy" : "lossless");
 
     /* Cleanup */
-    av_free(ctx.audio_buf);
+    avcodec_free_frame(&ctx.frame);
     av_free(ctx.rdft_data);
     av_rdft_end(ctx.rdft);
     av_free(ctx.samples);
     avcodec_close(ctx.codec);
-    av_close_input_file(fmt_ctx);
+    avformat_close_input(&fmt_ctx);
     return 0;
 }
